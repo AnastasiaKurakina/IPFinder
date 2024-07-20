@@ -1,78 +1,116 @@
-import netaddr
 import subprocess
-import locale
+import re
 import json
-import os
 
-def get_arp_data(ip_address):
+def get_arp_table():
     """
-    Получает данные ARP для указанного IP-адреса.
-    
-    Args:
-        ip_address (str): IP-адрес коммутатора или устройства.
-    
+    Получает ARP-таблицу из локальной сети, вызывая команду arp -a.
+
     Returns:
-        list: Список строк с данными ARP или None, если возникла ошибка.
+        str: Вывод команды arp -a, содержащий IP и MAC адреса.
     """
     try:
-        # Получаем данные ARP и декодируем с использованием кодировки по умолчанию
-        arp_output = subprocess.check_output(['arp', '-a', ip_address]).decode(errors='ignore').split('\n')
-        return arp_output
-    except subprocess.CalledProcessError:
+        # Получаем вывод команды arp -a
+        output = subprocess.check_output(['arp', '-a'], universal_newlines=True, encoding='cp866')
+        return output
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
         return None
 
-def search_recursively(current_switch, mac_address):
+def extract_ip_mac(arp_table):
     """
-    Рекурсивная функция для поиска по дереву коммутаторов.
-    
+    Извлекает IP и MAC адреса из ARP-таблицы.
+
     Args:
-        current_switch (dict): Словарь с информацией о текущем коммутаторе.
-        mac_address (str): MAC-адрес устройства в формате XX:XX:XX:XX:XX:XX.
-    
-    Returns:
-        tuple: (ip_address, path) или (None, None), если не найдено.
-    """
-    arp_output = get_arp_data(current_switch["ip_address"])
-    if arp_output:
-        for line in arp_output:
-            if mac_address.upper() in line.upper():
-                ip_address = line.split()[0]
-                path = [current_switch["name"]]
-                return ip_address, path
-    
-    for device in current_switch.get("connected_devices", []):
-        if device["mac_address"].upper() == mac_address.upper():
-            return device["ip_address"], [current_switch["name"]]
-    
-    for child_switch in current_switch.get("child_switches", []):
-        ip_address, path = search_recursively(child_switch, mac_address)
-        if ip_address:
-            path.insert(0, current_switch["name"])
-            return ip_address, path
-    
-    return None, None
+        arp_table (str): Вывод команды arp -a, содержащий ARP-таблицу.
 
-def find_ip_and_switch_by_mac(mac_address, switch_data):
+    Returns:
+        list: Список кортежей, где каждый кортеж содержит IP и MAC адрес.
     """
-    Находит IP-адрес устройства и путь до него от центрального коммутатора по его MAC-адресу.
-    
+    ip_mac_pattern = re.compile(r'(\d+\.\d+\.\d+\.\d+)\s+([\da-fA-F-]+)')
+    matches = ip_mac_pattern.findall(arp_table)
+    return matches
+
+def normalize_mac(mac_address):
+    """
+    Нормализует MAC-адрес, заменяя тире на двоеточия.
+
     Args:
-        mac_address (str): MAC-адрес устройства в формате XX:XX:XX:XX:XX:XX.
-        switch_data (dict): Словарь с информацией о коммутаторах и подключенных устройствах.
-    
+        mac_address (str): MAC-адрес для нормализации.
+
     Returns:
-        tuple: (ip_address, path) или (None, None), если не найдено.
+        str: Нормализованный MAC-адрес.
     """
-    # Проверяем, что MAC-адрес имеет правильный формат
-    if not netaddr.valid_mac(mac_address):
-        return None, None
-    
-    # Ищем IP-адрес и коммутатор, соответствующие заданному MAC-адресу, начиная с центрального коммутатора
-    return search_recursively(switch_data, mac_address)
+    return mac_address.replace('-', ':')
 
-# Загружаем данные о коммутаторах из файла switch_data.json
-current_dir = os.path.dirname(os.path.abspath(__file__))
-switch_data_path = os.path.join(current_dir, 'switch_data.json')
+def get_ip_from_mac(mac_address, ip_mac_list):
+    """
+    Находит соответствующий IP-адрес для заданного MAC-адреса.
 
-with open(switch_data_path, 'r', encoding='utf-8') as f:
-    switch_data = json.load(f)
+    Args:
+        mac_address (str): MAC-адрес, для которого необходимо найти IP-адрес.
+        ip_mac_list (list): Список кортежей, содержащих IP и MAC адреса.
+
+    Returns:
+        str or None: Соответствующий IP-адрес, если найден, иначе None.
+    """
+    normalized_mac = normalize_mac(mac_address)
+    for ip, mac in ip_mac_list:
+        if normalize_mac(mac) == normalized_mac:
+            return ip
+    return None
+
+def load_switch_data(file_path):
+    """
+    Загружает данные коммутаторов из JSON файла.
+
+    Args:
+        file_path (str): Путь к JSON файлу.
+
+    Returns:
+        list: Список устройств с их IP и MAC адресами.
+    """
+    devices = []
+
+    with open(file_path, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+
+        # Добавляем устройства из корневого уровня
+        for device in data.get('connected_devices', []):
+            devices.append((device['ip_address'], device['mac_address']))
+
+        # Рекурсивно добавляем устройства из дочерних коммутаторов
+        def add_devices(switch):
+            for device in switch.get('connected_devices', []):
+                devices.append((device['ip_address'], device['mac_address']))
+            for child_switch in switch.get('child_switches', []):
+                add_devices(child_switch)
+
+        add_devices(data)
+
+    return devices
+
+def load_arp_data(file_path):
+    """
+    Загружает данные ARP-таблицы из текстового файла.
+
+    Args:
+        file_path (str): Путь к текстовому файлу.
+
+    Returns:
+        list: Список кортежей, где каждый кортеж содержит IP и MAC адрес.
+    """
+    ip_mac_list = []
+
+    try:
+        with open(file_path, 'r', encoding='cp866') as file:
+            for line in file:
+                ip, mac = line.strip().split()
+                ip_mac_list.append((ip, mac))
+    except FileNotFoundError:
+        print(f"Файл {file_path} не найден.")
+    except ValueError:
+        print("Ошибка в формате файла. Ожидается: IP MAC")
+
+    return ip_mac_list
+
